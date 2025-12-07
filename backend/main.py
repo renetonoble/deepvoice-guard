@@ -52,30 +52,33 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-# --- CORE LOGIC ---
+# --- CORE LOGIC (DEBUG VERSION) ---
 def preprocess_audio(file_bytes: io.BytesIO):
-    """
-    Converts raw audio bytes -> Mel Spectrogram -> DB Scale -> Normalized -> Reshaped
-    Must replicate training logic exactly.
-    """
     try:
         # 1. Load Audio
-        # librosa.load resamples the audio to 22050Hz automatically
-        audio, _ = librosa.load(file_bytes, sr=SAMPLE_RATE, duration=DURATION)
+        print("🔍 Debug: Loading audio...")
+        audio, sr = librosa.load(file_bytes, sr=SAMPLE_RATE, duration=DURATION)
         
-        # 2. Pad/Crop to exactly 2.0s
+        # DEBUG: Check if audio is empty
+        print(f"📊 Audio Stats - Shape: {audio.shape}, Max: {np.max(audio)}, Min: {np.min(audio)}")
+        if np.max(audio) == 0:
+            print("⚠️ WARNING: Audio Signal is SILENCE!")
+
+        # 2. Pad/Crop
         target_len = int(DURATION * SAMPLE_RATE)
         if len(audio) < target_len:
             audio = np.pad(audio, (0, target_len - len(audio)))
         else:
             audio = audio[:target_len]
         
-        # 3. Mel Spectrogram (The 'Image' of the sound)
+        # 3. Mel Spectrogram
         mel_spectrogram = librosa.feature.melspectrogram(y=audio, sr=SAMPLE_RATE, n_mels=N_MELS)
         mel_spec_db = librosa.power_to_db(mel_spectrogram, ref=np.max)
         
-        # 4. Fix Width (Time Steps)
-        # STFT windows can vary slightly; force strict shape for the CNN
+        # DEBUG: Check Spectrogram
+        print(f"📊 Spec Stats - Mean: {np.mean(mel_spec_db)}, Max: {np.max(mel_spec_db)}")
+
+        # 4. Fix Width
         current_width = mel_spec_db.shape[1]
         if current_width < MAX_TIME_STEPS:
             padding = MAX_TIME_STEPS - current_width
@@ -83,24 +86,16 @@ def preprocess_audio(file_bytes: io.BytesIO):
         else:
             mel_spec_db = mel_spec_db[:, :MAX_TIME_STEPS]
 
-        # 5. Normalize (Physics of Neural Networks)
-        # Shift values from [-80, 0] dB to [0, 1] range for stability
+        # 5. Normalize
         mel_spec_db = (mel_spec_db + 80) / 80
 
-        # 6. Reshape for TFLite Input
-        # Model Expects: (Batch, Freq, Time) -> (1, 128, 87)
+        # 6. Reshape
         input_data = mel_spec_db.reshape(1, N_MELS, MAX_TIME_STEPS)
-        
-        # TFLite requires float32 specifically
         return input_data.astype(np.float32)
 
     except Exception as e:
-        print(f"Preprocessing Error: {e}")
+        print(f"❌ Preprocessing Error: {e}")
         raise ValueError("Failed to process audio file")
-
-@app.get("/")
-async def root():
-    return {"status": "DeepVoice Guard (TFLite) is Online"}
 
 @app.post("/analyze")
 async def analyze_audio(file: UploadFile = File(...)):
@@ -108,22 +103,23 @@ async def analyze_audio(file: UploadFile = File(...)):
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     try:
-        # 1. Preprocess
+        print(f"🚀 Received File: {file.filename}")
         contents = await file.read()
         audio_stream = io.BytesIO(contents)
+        
+        # Run Preprocessing
         input_tensor = preprocess_audio(audio_stream)
 
-        # 2. Inference (TFLite Style)
-        # Set the input tensor
+        # Run Inference
         interpreter.set_tensor(input_details[0]['index'], input_tensor)
-        # Run the model
         interpreter.invoke()
-        # Get the output tensor
         output_data = interpreter.get_tensor(output_details[0]['index'])
+        
+        # DEBUG: Raw Output
+        raw_pred = output_data[0][0]
+        print(f"🧠 Model Raw Output: {raw_pred}")
 
-        # 3. Result Interpretation
-        confidence = float(output_data[0][0])
-        # If confidence > 0.5, the model thinks it belongs to Class 1 (Fake)
+        confidence = float(raw_pred)
         is_fake = confidence > 0.5 
         
         return {
