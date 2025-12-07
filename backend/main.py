@@ -3,17 +3,17 @@ import numpy as np
 import librosa
 import tensorflow as tf
 from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware  # <--- CRITICAL IMPORT
 from contextlib import asynccontextmanager
 
 # --- CONFIGURATION ---
-# We use the optimized TFLite model now
 MODEL_PATH = "model.tflite"
 SAMPLE_RATE = 22050
 DURATION = 2.0
 N_MELS = 128
 MAX_TIME_STEPS = 87
 
-# Global interpreter variable
+# Global interpreter variables
 interpreter = None
 input_details = None
 output_details = None
@@ -25,11 +25,11 @@ async def lifespan(app: FastAPI):
     try:
         print(f"Loading TFLite Model: {MODEL_PATH}...")
         
-        # Load TFLite Interpreter (Super lightweight)
+        # Load TFLite Interpreter (Super lightweight, optimized for CPU)
         interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
         interpreter.allocate_tensors()
         
-        # Get input and output details
+        # Get input and output details once to save time per request
         input_details = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
         
@@ -43,27 +43,39 @@ async def lifespan(app: FastAPI):
 # --- INIT APP ---
 app = FastAPI(title="DeepVoice Guard API", lifespan=lifespan)
 
+# --- SECURITY: CORS MIDDLEWARE (The Bridge to Frontend) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins (Dev mode: safe for hackathons)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all HTTP methods (POST, GET, OPTIONS)
+    allow_headers=["*"],  # Allows all headers
+)
+
 # --- CORE LOGIC ---
 def preprocess_audio(file_bytes: io.BytesIO):
     """
-    Same signal processing, but output shape must match TFLite input.
+    Converts raw audio bytes -> Mel Spectrogram -> DB Scale -> Normalized -> Reshaped
+    Must replicate training logic exactly.
     """
     try:
         # 1. Load Audio
+        # librosa.load resamples the audio to 22050Hz automatically
         audio, _ = librosa.load(file_bytes, sr=SAMPLE_RATE, duration=DURATION)
         
-        # 2. Pad/Crop to 2.0s
+        # 2. Pad/Crop to exactly 2.0s
         target_len = int(DURATION * SAMPLE_RATE)
         if len(audio) < target_len:
             audio = np.pad(audio, (0, target_len - len(audio)))
         else:
             audio = audio[:target_len]
         
-        # 3. Mel Spectrogram
+        # 3. Mel Spectrogram (The 'Image' of the sound)
         mel_spectrogram = librosa.feature.melspectrogram(y=audio, sr=SAMPLE_RATE, n_mels=N_MELS)
         mel_spec_db = librosa.power_to_db(mel_spectrogram, ref=np.max)
         
         # 4. Fix Width (Time Steps)
+        # STFT windows can vary slightly; force strict shape for the CNN
         current_width = mel_spec_db.shape[1]
         if current_width < MAX_TIME_STEPS:
             padding = MAX_TIME_STEPS - current_width
@@ -71,14 +83,15 @@ def preprocess_audio(file_bytes: io.BytesIO):
         else:
             mel_spec_db = mel_spec_db[:, :MAX_TIME_STEPS]
 
-        # 5. Normalize (Critical for Neural Networks)
-        # Assuming training data was 0-255 or similar, but standard spectrograms are -80dB to 0dB.
-        # We normalize to [0, 1] roughly to match training stability.
+        # 5. Normalize (Physics of Neural Networks)
+        # Shift values from [-80, 0] dB to [0, 1] range for stability
         mel_spec_db = (mel_spec_db + 80) / 80
 
-        # 6. Reshape for TFLite
-        # The model expects (1, 128, 87) - 3D Tensor
+        # 6. Reshape for TFLite Input
+        # Model Expects: (Batch, Freq, Time) -> (1, 128, 87)
         input_data = mel_spec_db.reshape(1, N_MELS, MAX_TIME_STEPS)
+        
+        # TFLite requires float32 specifically
         return input_data.astype(np.float32)
 
     except Exception as e:
@@ -101,12 +114,16 @@ async def analyze_audio(file: UploadFile = File(...)):
         input_tensor = preprocess_audio(audio_stream)
 
         # 2. Inference (TFLite Style)
+        # Set the input tensor
         interpreter.set_tensor(input_details[0]['index'], input_tensor)
+        # Run the model
         interpreter.invoke()
+        # Get the output tensor
         output_data = interpreter.get_tensor(output_details[0]['index'])
 
-        # 3. Result
+        # 3. Result Interpretation
         confidence = float(output_data[0][0])
+        # If confidence > 0.5, the model thinks it belongs to Class 1 (Fake)
         is_fake = confidence > 0.5 
         
         return {
